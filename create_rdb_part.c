@@ -4,13 +4,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
 #include <strings.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <linux/fs.h>
 
 #define SECTOR_SIZE 512
@@ -22,7 +25,13 @@
 #define BLKGETSIZE _IO(0x12,96)
 #endif
 #ifndef BLKGETSIZE64
-#define BLKGETSIZE64 _IOR(0x12,114,size_t)
+#define BLKGETSIZE64 _IOR(0x12,114,uint64_t)
+#endif
+#ifndef BLKRRPART
+#define BLKRRPART _IO(0x12,95)
+#endif
+#ifndef S_IFBLK
+#define S_IFBLK 0060000
 #endif
 
 typedef struct {
@@ -35,6 +44,7 @@ typedef struct {
     uint32_t high;
     char name[32];
     uint32_t dostype;
+    int number;
 } PartInfo;
 
 static const DosTypeMap dostype_table[] = {
@@ -47,8 +57,9 @@ static const DosTypeMap dostype_table[] = {
     {"SFS2",     0x53465302},
     {"PFS3",     0x50465303},
     {"SWAP",     0x53575000},
-    {"EXT2",     0x45585432},
-    {"EXT3",     0x45585433},
+    {"SWP",      0x53575000},
+    {"EXT2",     0x45585402},
+    {"EXT3",     0x45585403},
     {NULL, 0}
 };
 
@@ -89,10 +100,130 @@ static inline void write_be32(uint8_t *ptr, uint32_t val) {
 static void update_rdb_checksum(uint8_t *block) {
     write_be32(&block[8], 0);
     uint32_t sum = 0;
-    for (int i = 0; i < SECTOR_SIZE; i += 4) {
-        sum += read_be32(&block[i]);
+    uint32_t sum_longs = read_be32(&block[4]);
+    if (sum_longs == 0 || sum_longs > SECTOR_SIZE / 4) {
+        sum_longs = SECTOR_SIZE / 4;
+    }
+    for (uint32_t i = 0; i < sum_longs; i++) {
+        sum += read_be32(&block[i * 4]);
     }
     write_be32(&block[8], 0 - sum);
+}
+
+static int seek_exact(int fd, off_t offset, int whence) {
+    if (lseek(fd, offset, whence) == (off_t)-1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int read_exact(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, (char *)buf + total, len - total);
+        if (n < 0) {
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+static int write_exact(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, (const char *)buf + total, len - total);
+        if (n < 0) {
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+static void ensure_partition_device_node(const char *device, unsigned int partition_number) {
+    struct stat disk_stat;
+    char partition_device[PATH_MAX];
+
+    if (stat(device, &disk_stat) != 0 || !S_ISBLK(disk_stat.st_mode)) {
+        return;
+    }
+
+    int written = snprintf(partition_device, sizeof(partition_device), "%s%u",
+                           device, partition_number);
+    if (written < 0 || (size_t)written >= sizeof(partition_device)) {
+        return;
+    }
+
+    dev_t partition_dev = makedev(major(disk_stat.st_rdev),
+                                  minor(disk_stat.st_rdev) + partition_number);
+    struct stat node_stat;
+    if (lstat(partition_device, &node_stat) == 0) {
+        if (S_ISBLK(node_stat.st_mode) && node_stat.st_rdev == partition_dev) {
+            return;
+        }
+        if (S_ISBLK(node_stat.st_mode) && unlink(partition_device) != 0) {
+            fprintf(stderr, "[!] Konnte veralteten Device-Node '%s' nicht entfernen: %s\n",
+                    partition_device, strerror(errno));
+            return;
+        }
+        if (!S_ISBLK(node_stat.st_mode)) {
+            fprintf(stderr, "[!] '%s' ist kein Block-Device; Node wurde nicht ersetzt.\n",
+                    partition_device);
+            return;
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "[!] Konnte '%s' nicht prüfen: %s\n",
+                partition_device, strerror(errno));
+        return;
+    }
+
+    if (mknod(partition_device, S_IFBLK | 0600, partition_dev) != 0) {
+        fprintf(stderr, "[!] Konnte '%s' nicht anlegen: %s\n",
+                partition_device, strerror(errno));
+        fprintf(stderr, "    Manuell als root: mknod %s b %u %u\n",
+                partition_device, major(partition_dev), minor(partition_dev));
+        return;
+    }
+
+    printf("[+] Device-Node '%s' wurde angelegt.\n", partition_device);
+}
+
+static int partition_is_active(const char *device) {
+    struct stat target_stat;
+    if (stat(device, &target_stat) != 0 || !S_ISBLK(target_stat.st_mode)) {
+        return 0;
+    }
+
+    const char *files[] = {"/proc/mounts", "/proc/swaps"};
+    char line[1024];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        FILE *stream = fopen(files[i], "r");
+        if (stream == NULL) {
+            continue;
+        }
+        while (fgets(line, sizeof(line), stream) != NULL) {
+            char path[PATH_MAX];
+            if (sscanf(line, "%1023s", path) != 1) {
+                continue;
+            }
+            struct stat active_stat;
+            if (stat(path, &active_stat) == 0 &&
+                S_ISBLK(active_stat.st_mode) &&
+                active_stat.st_rdev == target_stat.st_rdev) {
+                fclose(stream);
+                return 1;
+            }
+        }
+        fclose(stream);
+    }
+    return 0;
 }
 
 static uint32_t resolve_dostype(const char *str) {
@@ -218,7 +349,14 @@ static int calculate_cylinders(const char *start_str, const char *end_str,
         *low_cyl = (uint32_t)start_val;
     }
 
-    if (end_str[0] == '+') {
+    if (strcmp(end_str, "+") == 0) {
+        uint64_t total_cylinders = disk_size_bytes / cyl_size_bytes;
+        if (total_cylinders == 0 || total_cylinders > UINT32_MAX) {
+            fprintf(stderr, "[-] Fehler: Datenträgergröße überschreitet den unterstützten Zylinderbereich.\n");
+            return 0;
+        }
+        *high_cyl = (uint32_t)total_cylinders - 1;
+    } else if (end_str[0] == '+') {
         uint64_t rel_val = parse_size_to_bytes(end_str + 1, disk_size_bytes, &has_unit);
         if (has_unit) {
             uint32_t cyls_needed = (uint32_t)((rel_val + cyl_size_bytes - 1) / cyl_size_bytes);
@@ -245,38 +383,95 @@ static int calculate_cylinders(const char *start_str, const char *end_str,
 }
 
 static uint32_t get_sector_by_sorted_index(int fd, uint32_t first_part, long target_num) {
-    typedef struct {
-        uint32_t sector;
-        uint32_t low;
-    } SortInfo;
-    
-    SortInfo sparts[64];
-    int sp_count = 0;
+    long number = 1;
     uint32_t curr = first_part;
     uint8_t block[SECTOR_SIZE];
     
-    while (curr != 0xFFFFFFFF && curr != 0 && sp_count < 64) {
-        lseek(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET);
-        if (read(fd, block, SECTOR_SIZE) == SECTOR_SIZE && read_be32(&block[0]) == ID_PART) {
-            sparts[sp_count].sector = curr;
-            sparts[sp_count].low = read_be32(&block[164]);
-            sp_count++;
+    while (curr != 0xFFFFFFFF && curr != 0 && number <= 64) {
+        if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0) {
+            return 0;
+        }
+        if (read_exact(fd, block, SECTOR_SIZE) == 0 && read_be32(&block[0]) == ID_PART) {
+            if (number == target_num) {
+                return curr;
+            }
+            number++;
         }
         curr = read_be32(&block[16]);
     }
-    
-    if (target_num <= 0 || target_num > sp_count) return 0;
+    return 0;
+}
 
-    for (int i = 0; i < sp_count - 1; i++) {
-        for (int j = 0; j < sp_count - i - 1; j++) {
-            if (sparts[j].low > sparts[j+1].low) {
-                SortInfo temp = sparts[j];
-                sparts[j] = sparts[j+1];
-                sparts[j+1] = temp;
-            }
+static long get_partition_count(int fd, uint32_t first_part) {
+    uint32_t curr = first_part;
+    uint8_t block[SECTOR_SIZE];
+    long count = 0;
+
+    while (curr != 0xFFFFFFFF && curr != 0 && count < 64) {
+        if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0 ||
+            read_exact(fd, block, SECTOR_SIZE) != 0) {
+            return count;
         }
+        if (read_be32(&block[0]) == ID_PART) {
+            count++;
+        }
+        curr = read_be32(&block[16]);
     }
-    return sparts[target_num - 1].sector;
+    return count;
+}
+
+static long get_partition_index_by_sector(int fd, uint32_t first_part, uint32_t target_sector) {
+    uint32_t curr = first_part;
+    uint8_t block[SECTOR_SIZE];
+    long number = 1;
+
+    while (curr != 0xFFFFFFFF && curr != 0 && number <= 64) {
+        if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0 ||
+            read_exact(fd, block, SECTOR_SIZE) != 0) {
+            return 0;
+        }
+        if (read_be32(&block[0]) == ID_PART) {
+            if (curr == target_sector) {
+                return number;
+            }
+            number++;
+        }
+        curr = read_be32(&block[16]);
+    }
+    return 0;
+}
+
+static void remove_partition_device_node(const char *device, long partition_number) {
+    if (partition_number <= 0) {
+        return;
+    }
+
+    char partition_device[PATH_MAX];
+    int written = snprintf(partition_device, sizeof(partition_device), "%s%ld",
+                           device, partition_number);
+    if (written < 0 || (size_t)written >= sizeof(partition_device)) {
+        return;
+    }
+
+    struct stat node_stat;
+    if (lstat(partition_device, &node_stat) != 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "[!] Konnte '%s' nicht prüfen: %s\n",
+                    partition_device, strerror(errno));
+        }
+        return;
+    }
+    if (!S_ISBLK(node_stat.st_mode)) {
+        fprintf(stderr, "[!] '%s' ist kein Block-Device; Node wurde nicht gelöscht.\n",
+                partition_device);
+        return;
+    }
+    if (unlink(partition_device) != 0) {
+        fprintf(stderr, "[!] Konnte Device-Node '%s' nicht löschen: %s\n",
+                partition_device, strerror(errno));
+        return;
+    }
+    printf("[+] Device-Node '%s' wurde gelöscht.\n", partition_device);
 }
 
 static int do_rename(int fd, const char *device, const char *target_arg, const char *new_name) {
@@ -289,12 +484,15 @@ static int do_rename(int fd, const char *device, const char *target_arg, const c
     long target_num = strtol(target_arg, &endptr, 10);
     int is_numeric = (*endptr == '\0' && target_num > 0);
 
-    lseek(fd, 0, SEEK_SET);
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Zurücksetzen des Dateizeigers");
+        return 1;
+    }
 
     uint8_t rdsk[SECTOR_SIZE];
     int rdsk_sec = -1;
     for (int i = 0; i < RDB_SECTORS_RESERVED; i++) {
-        if (read(fd, rdsk, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (read_exact(fd, rdsk, SECTOR_SIZE) != 0) break;
         if (read_be32(&rdsk[0]) == ID_RDSK) {
             rdsk_sec = i;
             break;
@@ -302,13 +500,12 @@ static int do_rename(int fd, const char *device, const char *target_arg, const c
     }
 
     if (rdsk_sec == -1) {
-        fprintf(stderr, "[-] Kein Amiga RDB auf '%s' gefunden. Ist die Partitionstabelle initialisiert?\n", device);
+        fprintf(stderr, "[-] Kein Partitionstabellen-Header auf '%s' gefunden. Ist die Partitionstabelle initialisiert?\n", device);
         return 1;
     }
 
     uint32_t curr = read_be32(&rdsk[28]);
     uint32_t target_sector = 0;
-
     if (is_numeric) {
         target_sector = get_sector_by_sorted_index(fd, curr, target_num);
         if (target_sector == 0) {
@@ -320,8 +517,11 @@ static int do_rename(int fd, const char *device, const char *target_arg, const c
     uint8_t block[SECTOR_SIZE];
 
     while (curr != 0xFFFFFFFF && curr != 0) {
-        lseek(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET);
-        if (read(fd, block, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0) {
+            perror("[-] Fehler beim Suchen der Partition");
+            return 1;
+        }
+        if (read_exact(fd, block, SECTOR_SIZE) != 0) break;
 
         if (read_be32(&block[0]) == ID_PART) {
             uint8_t name_len = block[36];
@@ -346,8 +546,11 @@ static int do_rename(int fd, const char *device, const char *target_arg, const c
 
                 update_rdb_checksum(block);
 
-                lseek(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET);
-                if (write(fd, block, SECTOR_SIZE) != SECTOR_SIZE) {
+                if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0) {
+                    perror("[-] Fehler beim Schreiben des neuen Partitionsnamens");
+                    return 1;
+                }
+                if (write_exact(fd, block, SECTOR_SIZE) != 0) {
                     perror("[-] Fehler beim Schreiben des neuen Partitionsnamens");
                     return 1;
                 }
@@ -361,9 +564,9 @@ static int do_rename(int fd, const char *device, const char *target_arg, const c
     }
 
     if (is_numeric) {
-        fprintf(stderr, "[-] Partition Nr. %ld wurde im RDB von '%s' nicht gefunden.\n", target_num, device);
+        fprintf(stderr, "[-] Partition Nr. %ld wurde in der Partitionstabelle von '%s' nicht gefunden.\n", target_num, device);
     } else {
-        fprintf(stderr, "[-] Partition '%s' wurde im RDB von '%s' nicht gefunden.\n", target_arg, device);
+        fprintf(stderr, "[-] Partition '%s' wurde in der Partitionstabelle von '%s' nicht gefunden.\n", target_arg, device);
     }
     return 1;
 }
@@ -373,12 +576,15 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
     long target_num = strtol(target_arg, &endptr, 10);
     int is_numeric = (*endptr == '\0' && target_num > 0);
 
-    lseek(fd, 0, SEEK_SET);
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Zurücksetzen des Dateizeigers");
+        return 1;
+    }
 
     uint8_t rdsk[SECTOR_SIZE];
     int rdsk_sec = -1;
     for (int i = 0; i < RDB_SECTORS_RESERVED; i++) {
-        if (read(fd, rdsk, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (read_exact(fd, rdsk, SECTOR_SIZE) != 0) break;
         if (read_be32(&rdsk[0]) == ID_RDSK) {
             rdsk_sec = i;
             break;
@@ -386,12 +592,14 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
     }
 
     if (rdsk_sec == -1) {
-        fprintf(stderr, "[-] Kein Amiga RDB auf '%s' gefunden.\n", device);
+        fprintf(stderr, "[-] Kein Partitionstabellen-Header auf '%s' gefunden.\n", device);
         return 1;
     }
 
     uint32_t curr = read_be32(&rdsk[28]);
     uint32_t target_sector = 0;
+    long partition_number = is_numeric ? target_num : 0;
+    long old_partition_count = get_partition_count(fd, curr);
 
     if (is_numeric) {
         target_sector = get_sector_by_sorted_index(fd, curr, target_num);
@@ -408,8 +616,11 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
 
     while (curr != 0xFFFFFFFF && curr != 0) {
         uint32_t sector_to_read = curr;
-        lseek(fd, (off_t)(sector_to_read * SECTOR_SIZE), SEEK_SET);
-        if (read(fd, block, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (seek_exact(fd, (off_t)(sector_to_read * SECTOR_SIZE), SEEK_SET) != 0) {
+            perror("[-] Fehler beim Lesen der Partition");
+            return 1;
+        }
+        if (read_exact(fd, block, SECTOR_SIZE) != 0) break;
 
         if (read_be32(&block[0]) == ID_PART) {
             uint8_t name_len = block[36];
@@ -427,22 +638,44 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
             }
 
             if (match) {
+                if (!is_numeric) {
+                    partition_number = get_partition_index_by_sector(fd, read_be32(&rdsk[28]),
+                                                                     sector_to_read);
+                }
+                if (partition_number <= 0) {
+                    fprintf(stderr, "[-] Konnte die Device-Node-Nummer der Partition nicht bestimmen.\n");
+                    return 1;
+                }
+                char partition_device[PATH_MAX];
+                int node_len = snprintf(partition_device, sizeof(partition_device), "%s%ld",
+                                        device, partition_number);
+                if (node_len < 0 || (size_t)node_len >= sizeof(partition_device)) {
+                    fprintf(stderr, "[-] Device-Node-Pfad ist zu lang.\n");
+                    return 1;
+                }
+                if (partition_is_active(partition_device)) {
+                    fprintf(stderr, "[-] Partition '%s' ist noch gemountet oder als Swap aktiv.\n",
+                            partition_device);
+                    fprintf(stderr, "    Bitte zuerst aushängen bzw. 'swapoff %s' ausführen.\n",
+                            partition_device);
+                    return 1;
+                }
                 if (!force_flag) {
                     uint32_t p_low = read_be32(&block[164]);
                     uint32_t p_high = read_be32(&block[168]);
                     uint32_t dostype = read_be32(&block[192]);
 
                     fprintf(stderr, "[!] WARNUNG: Partition ('%s', DosType 0x%08X) wird gelöscht!\n",
-                            current_name, dostype);
-                    fprintf(stderr, "    Zylinder %u-%u werden aus der RDB-Kette auf '%s' entfernt.\n",
-                            p_low, p_high, device);
+                           current_name, dostype);
+                    fprintf(stderr, "    Zylinder %u-%u werden aus der Tabellenkette auf '%s' entfernt.\n",
+                           p_low, p_high, device);
                     fprintf(stderr, "    Möchten Sie fortfahren? [y/N]: ");
                     
                     char answer[16];
                     if (fgets(answer, sizeof(answer), stdin) == NULL ||
-                        (answer[0] != 'y' && answer[0] != 'Y')) {
-                        printf("[-] Abgebrochen.\n");
-                        return 0;
+                       (answer[0] != 'y' && answer[0] != 'Y')) {
+                       printf("[-] Abgebrochen.\n");
+                       return 0;
                     }
                 }
 
@@ -451,26 +684,75 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
                 if (prev_is_rdsk) {
                     write_be32(&rdsk[28], next_ptr);
                     update_rdb_checksum(rdsk);
-                    lseek(fd, (off_t)(rdsk_sec * SECTOR_SIZE), SEEK_SET);
-                    write(fd, rdsk, SECTOR_SIZE);
+                    if (seek_exact(fd, (off_t)(rdsk_sec * SECTOR_SIZE), SEEK_SET) != 0) {
+                       perror("[-] Fehler beim Schreiben des RDB-Headers");
+                       return 1;
+                    }
+                    if (write_exact(fd, rdsk, SECTOR_SIZE) != 0) {
+                       perror("[-] Fehler beim Schreiben des RDB-Headers");
+                       return 1;
+                    }
                 } else {
                     uint8_t prev_block[SECTOR_SIZE];
-                    lseek(fd, (off_t)(prev_sector * SECTOR_SIZE), SEEK_SET);
-                    read(fd, prev_block, SECTOR_SIZE);
+                    if (seek_exact(fd, (off_t)(prev_sector * SECTOR_SIZE), SEEK_SET) != 0) {
+                       perror("[-] Fehler beim Lesen des Vorgängerblocks");
+                       return 1;
+                    }
+                    if (read_exact(fd, prev_block, SECTOR_SIZE) != 0) {
+                       fprintf(stderr, "[-] Fehler: Vorgängerblock für die Partition konnte nicht gelesen werden.\n");
+                       return 1;
+                    }
                     write_be32(&prev_block[16], next_ptr);
                     update_rdb_checksum(prev_block);
-                    lseek(fd, (off_t)(prev_sector * SECTOR_SIZE), SEEK_SET);
-                    write(fd, prev_block, SECTOR_SIZE);
+                    if (seek_exact(fd, (off_t)(prev_sector * SECTOR_SIZE), SEEK_SET) != 0) {
+                       perror("[-] Fehler beim Schreiben des Vorgängerblocks");
+                       return 1;
+                    }
+                    if (write_exact(fd, prev_block, SECTOR_SIZE) != 0) {
+                       perror("[-] Fehler beim Schreiben des Vorgängerblocks");
+                       return 1;
+                    }
                 }
 
                 uint8_t zero_block[SECTOR_SIZE];
                 memset(zero_block, 0, SECTOR_SIZE);
-                lseek(fd, (off_t)(sector_to_read * SECTOR_SIZE), SEEK_SET);
-                write(fd, zero_block, SECTOR_SIZE);
+                if (seek_exact(fd, (off_t)(sector_to_read * SECTOR_SIZE), SEEK_SET) != 0) {
+                    perror("[-] Fehler beim Löschen der Partition");
+                    return 1;
+                }
+                if (write_exact(fd, zero_block, SECTOR_SIZE) != 0) {
+                    perror("[-] Fehler beim Löschen der Partition");
+                    return 1;
+                }
 
                 fsync(fd);
+
+                int reread_ok = 1;
+                if (ioctl(fd, BLKRRPART) < 0) {
+                    reread_ok = 0;
+                    int reread_errno = errno;
+                    fprintf(stderr, "[!] Warnung: Konnte Partitionstabelle nicht automatisch beim Kernel aktualisieren: %s\n",
+                            strerror(reread_errno));
+                    fprintf(stderr, "    Bitte alle Partitionen aushängen und danach 'partprobe %s' oder 'blockdev --rereadpt %s' ausführen.\n",
+                            device, device);
+                    if (reread_errno == EBUSY) {
+                        fprintf(stderr, "    Solange eine Partition gemountet ist, bleiben neue Device-Nodes (z. B. /dev/hda5) unsichtbar.\n");
+                    }
+                } else {
+                    printf("[+] Partitionstabelle erfolgreich beim Kernel neu eingelesen.\n");
+                }
+
                 printf("[+] Partition ('%s') in Sektor %u erfolgreich gelöscht und Kette aktualisiert!\n",
                        current_name, sector_to_read);
+                if (reread_ok) {
+                    /*
+                     * Linux renumbers following partitions down. The old
+                     * highest node is therefore the only node to remove.
+                     */
+                    remove_partition_device_node(device, old_partition_count);
+                } else {
+                    fprintf(stderr, "[!] Device-Nodes wurden wegen des fehlgeschlagenen Kernel-Refresh nicht verändert.\n");
+                }
                 return 0;
             }
         }
@@ -481,20 +763,23 @@ static int do_rmpart(int fd, const char *device, const char *target_arg, int for
     }
 
     if (is_numeric) {
-        fprintf(stderr, "[-] Partition Nr. %ld wurde im RDB von '%s' nicht gefunden.\n", target_num, device);
+        fprintf(stderr, "[-] Partition Nr. %ld wurde in der Partitionstabelle von '%s' nicht gefunden.\n", target_num, device);
     } else {
-        fprintf(stderr, "[-] Partition '%s' wurde im RDB von '%s' nicht gefunden.\n", target_arg, device);
+        fprintf(stderr, "[-] Partition '%s' wurde in der Partitionstabelle von '%s' nicht gefunden.\n", target_arg, device);
     }
     return 1;
 }
 
 static int do_free(int fd, const char *device) {
-    lseek(fd, 0, SEEK_SET);
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Zurücksetzen des Dateizeigers");
+        return 1;
+    }
 
     uint8_t rdsk[SECTOR_SIZE];
     int rdsk_sec = -1;
     for (int i = 0; i < RDB_SECTORS_RESERVED; i++) {
-        if (read(fd, rdsk, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (read_exact(fd, rdsk, SECTOR_SIZE) != 0) break;
         if (read_be32(&rdsk[0]) == ID_RDSK) {
             rdsk_sec = i;
             break;
@@ -502,7 +787,7 @@ static int do_free(int fd, const char *device) {
     }
 
     if (rdsk_sec == -1) {
-        fprintf(stderr, "[-] Kein Amiga RDB auf '%s' gefunden. Bitte zuerst 'mklabel rdb' ausführen.\n", device);
+        fprintf(stderr, "[-] Keine Partitionstabelle auf '%s' gefunden. Bitte zuerst 'mklabel rdb' ausführen.\n", device);
         return 1;
     }
 
@@ -513,7 +798,7 @@ static int do_free(int fd, const char *device) {
     uint32_t rdb_high_cyl      = read_be32(&rdsk[140]);
 
     if (surfaces == 0 || sectors_per_track == 0) {
-        fprintf(stderr, "[-] Ungültige RDB-Geometrie auf '%s'.\n", device);
+        fprintf(stderr, "[-] Ungültige Tabellengeometrie auf '%s'.\n", device);
         return 1;
     }
 
@@ -527,13 +812,17 @@ static int do_free(int fd, const char *device) {
     uint8_t block[SECTOR_SIZE];
 
     while (curr != 0xFFFFFFFF && curr != 0 && part_count < 64) {
-        lseek(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET);
-        if (read(fd, block, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (seek_exact(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET) != 0) {
+            fprintf(stderr, "[-] Fehler: Partitionstabelle konnte nicht gelesen werden.\n");
+            return 1;
+        }
+        if (read_exact(fd, block, SECTOR_SIZE) != 0) break;
 
         if (read_be32(&block[0]) == ID_PART) {
             parts[part_count].low = read_be32(&block[164]);
             parts[part_count].high = read_be32(&block[168]);
             parts[part_count].dostype = read_be32(&block[192]);
+            parts[part_count].number = part_count + 1;
 
             uint8_t name_len = block[36];
             if (name_len > 31) name_len = 31;
@@ -556,13 +845,13 @@ static int do_free(int fd, const char *device) {
     uint32_t track_cyl = rdb_low_cyl;
     uint64_t total_free_bytes = 0;
 
-    printf(" %-4s | %-12s | %-16s | %-14s | %s\n", "Nr.", "Typ", "Zylinder", "Größe", "Details / Name");
+    printf(" %-4s | %-12s | %-16s | %-14s | %s\n", "Nr.", "Typ", "Zylinder", "Größe", "Details / Name / Offset");
     printf("-----------------------------------------------------------------------------------\n");
 
     if (rdb_low_cyl > 0) {
         char cyl_range[32];
         snprintf(cyl_range, sizeof(cyl_range), "%u - %u", 0, rdb_low_cyl - 1);
-        printf(" %-4s | %-12s | %-16s | %-14s | System-Bereich (RDB/Boot)\n", 
+        printf(" %-4s | %-12s | %-16s | %-14s | System-Bereich (Header/Boot)\n", 
                "-", "[System]", cyl_range, "-");
     }
 
@@ -589,10 +878,12 @@ static int do_free(int fd, const char *device) {
 
         uint32_t part_cyls = parts[i].high - parts[i].low + 1;
         uint64_t part_bytes = (uint64_t)part_cyls * cyl_size_bytes;
+        uint64_t start_bytes = (uint64_t)parts[i].low * cyl_size_bytes;
+        
         char sz_str[32], cyl_range[32], num_str[8], fs_str[16];
         
         snprintf(cyl_range, sizeof(cyl_range), "%u - %u", parts[i].low, parts[i].high);
-        snprintf(num_str, sizeof(num_str), "#%d", i + 1);
+        snprintf(num_str, sizeof(num_str), "#%d", parts[i].number);
         get_dostype_string(parts[i].dostype, fs_str, sizeof(fs_str));
 
         if (part_bytes >= 1024ULL*1024*1024) {
@@ -601,8 +892,8 @@ static int do_free(int fd, const char *device) {
             snprintf(sz_str, sizeof(sz_str), "%.2f MB", (double)part_bytes / (1024.0*1024));
         }
 
-        printf(" %-4s | %-12s | %-16s | %-14s | Name: %-8s (DosType: 0x%08X)\n", 
-               num_str, fs_str, cyl_range, sz_str, parts[i].name, parts[i].dostype);
+        printf(" %-4s | %-12s | %-16s | %-14s | Name: %-6s (DosType: 0x%08X, Offset: %llu Bytes)\n", 
+               num_str, fs_str, cyl_range, sz_str, parts[i].name, parts[i].dostype, (unsigned long long)start_bytes);
 
         if (parts[i].high + 1 > track_cyl) {
             track_cyl = parts[i].high + 1;
@@ -643,13 +934,13 @@ static int do_free(int fd, const char *device) {
 }
 
 static int do_mklabel(int fd, const char *device, const char *label_type, int force_flag) {
-    if (strcasecmp(label_type, "rdb") != 0 && strcasecmp(label_type, "amiga") != 0) {
-        fprintf(stderr, "[-] Ungültiges Label: '%s'. Unterstützte Labels: 'rdb' oder 'amiga'\n", label_type);
+    if (strcasecmp(label_type, "rdb") != 0 && strcasecmp(label_type, "amiga") != 0 && strcasecmp(label_type, "disk") != 0) {
+        fprintf(stderr, "[-] Ungültiges Label: '%s'. Unterstützte Labels: 'rdb'\n", label_type);
         return 1;
     }
 
     if (!force_flag) {
-        fprintf(stderr, "[!] WARNUNG: 'mklabel' überschreibt den gesamten RDB-Bereich (Sektor 0-63) auf '%s'!\n", device);
+        fprintf(stderr, "[!] WARNUNG: 'mklabel' überschreibt den gesamten Tabellen-Bereich (Sektor 0-63) auf '%s'!\n", device);
         fprintf(stderr, "    Bestehende Partitionen und Daten gehen dabei unwiderruflich verloren.\n");
         fprintf(stderr, "    Möchten Sie fortfahren? [y/N]: ");
         
@@ -670,7 +961,10 @@ static int do_mklabel(int fd, const char *device, const char *label_type, int fo
         fprintf(stderr, "[-] Fehler: Konnte Festplattengröße von '%s' nicht bestimmen.\n", device);
         return 1;
     }
-    lseek(fd, 0, SEEK_SET);
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Zurücksetzen des Dateizeigers");
+        return 1;
+    }
 
     uint32_t heads = 16;
     uint32_t sectors_per_track = 63;
@@ -679,14 +973,17 @@ static int do_mklabel(int fd, const char *device, const char *label_type, int fo
     uint32_t cylinders = (uint32_t)(total_sectors / cyl_sectors);
 
     if (cylinders < 4) {
-        fprintf(stderr, "[-] Datenträger '%s' ist zu klein für eine RDB-Partitionstabelle.\n", device);
+        fprintf(stderr, "[-] Datenträger '%s' ist zu klein für diese Partitionstabelle.\n", device);
         return 1;
     }
 
     uint8_t zero_block[SECTOR_SIZE];
     memset(zero_block, 0, SECTOR_SIZE);
     for (int i = 0; i < RDB_SECTORS_RESERVED; i++) {
-        write(fd, zero_block, SECTOR_SIZE);
+        if (write_exact(fd, zero_block, SECTOR_SIZE) != 0) {
+            perror("[-] Fehler beim Löschen des Tabellenbereichs");
+            return 1;
+        }
     }
 
     uint8_t rdsk[SECTOR_SIZE];
@@ -718,20 +1015,37 @@ static int do_mklabel(int fd, const char *device, const char *label_type, int fo
     write_be32(&rdsk[156], 0);                 /* rdb_Reserved4 */
 
     memcpy(&rdsk[160], "GENERIC ", 8);         /* rdb_DiskVendor */
-    memcpy(&rdsk[168], "AMIGA RDB DISK  ", 16);  /* rdb_DiskProduct */
+    memcpy(&rdsk[168], "STANDARD DISK   ", 16);  /* rdb_DiskProduct */
     memcpy(&rdsk[184], "1.0 ", 4);             /* rdb_DiskRevision */
 
     update_rdb_checksum(rdsk);
 
-    lseek(fd, 0, SEEK_SET);
-    if (write(fd, rdsk, SECTOR_SIZE) != SECTOR_SIZE) {
-        perror("[-] Fehler beim Schreiben des RDB-Headers");
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Schreiben des Tabellen-Headers");
+        return 1;
+    }
+    if (write_exact(fd, rdsk, SECTOR_SIZE) != 0) {
+        perror("[-] Fehler beim Schreiben des Tabellen-Headers");
         return 1;
     }
 
     fsync(fd);
+
+    if (ioctl(fd, BLKRRPART) < 0) {
+        int reread_errno = errno;
+        fprintf(stderr, "[!] Warnung: Konnte Partitionstabelle nicht automatisch beim Kernel aktualisieren: %s\n",
+                strerror(reread_errno));
+        fprintf(stderr, "    Bitte alle Partitionen aushängen und danach 'partprobe %s' oder 'blockdev --rereadpt %s' ausführen.\n",
+                device, device);
+        if (reread_errno == EBUSY) {
+            fprintf(stderr, "    Solange eine Partition gemountet ist, bleiben neue Device-Nodes (z. B. /dev/hda5) unsichtbar.\n");
+        }
+    } else {
+        printf("[+] Partitionstabelle erfolgreich beim Kernel neu eingelesen.\n");
+    }
+
     double size_gb = (double)total_bytes / (1024.0 * 1024.0 * 1024.0);
-    printf("[+] Neues Amiga RDB Disklabel auf '%s' erstellt (%.2f GB, %u Zylinder).\n", device, size_gb, cylinders);
+    printf("[+] Neue Partitionstabelle auf '%s' erstellt (%.2f GB, %u Zylinder).\n", device, size_gb, cylinders);
     return 0;
 }
 
@@ -748,12 +1062,15 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
         fprintf(stderr, "[-] Fehler: Konnte Festplattengröße von '%s' nicht bestimmen.\n", device);
         return 1;
     }
-    lseek(fd, 0, SEEK_SET);
+    if (seek_exact(fd, 0, SEEK_SET) != 0) {
+        perror("[-] Fehler beim Zurücksetzen des Dateizeigers");
+        return 1;
+    }
 
     uint8_t rdsk[SECTOR_SIZE];
     int rdsk_sec = -1;
     for (int i = 0; i < RDB_SECTORS_RESERVED; i++) {
-        if (read(fd, rdsk, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (read_exact(fd, rdsk, SECTOR_SIZE) != 0) break;
         if (read_be32(&rdsk[0]) == ID_RDSK) {
             rdsk_sec = i;
             break;
@@ -761,7 +1078,7 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     }
 
     if (rdsk_sec == -1) {
-        fprintf(stderr, "[-] Kein Amiga RDB auf '%s' gefunden. Bitte zuerst 'mklabel rdb' ausführen.\n", device);
+        fprintf(stderr, "[-] Keine Partitionstabelle auf '%s' gefunden. Bitte zuerst 'mklabel rdb' ausführen.\n", device);
         return 1;
     }
 
@@ -771,7 +1088,7 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     uint32_t rdb_high_cyl      = read_be32(&rdsk[140]);
 
     if (surfaces == 0 || sectors_per_track == 0) {
-        fprintf(stderr, "[-] Ungültige RDB-Geometrie auf '%s'.\n", device);
+        fprintf(stderr, "[-] Ungültige Tabellengeometrie auf '%s'.\n", device);
         return 1;
     }
 
@@ -785,8 +1102,11 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     uint32_t curr_p = first_part;
     uint8_t tmp_block[SECTOR_SIZE];
     while (curr_p != 0xFFFFFFFF && curr_p != 0 && part_count < 64) {
-        lseek(fd, (off_t)(curr_p * SECTOR_SIZE), SEEK_SET);
-        if (read(fd, tmp_block, SECTOR_SIZE) != SECTOR_SIZE) break;
+        if (seek_exact(fd, (off_t)(curr_p * SECTOR_SIZE), SEEK_SET) != 0) {
+            fprintf(stderr, "[-] Fehler: Partitionstabelle konnte nicht gelesen werden.\n");
+            return 1;
+        }
+        if (read_exact(fd, tmp_block, SECTOR_SIZE) != 0) break;
         if (read_be32(&tmp_block[0]) == ID_PART) {
             parts[part_count].low = read_be32(&tmp_block[164]);
             parts[part_count].high = read_be32(&tmp_block[168]);
@@ -824,6 +1144,11 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
 
                     low_cyl = candidate_low;
                     high_cyl = low_cyl + cyls_needed - 1;
+                    found_gap = 1;
+                    break;
+                } else if (strcmp(end_str, "+") == 0) {
+                    low_cyl = candidate_low;
+                    high_cyl = candidate_high;
                     found_gap = 1;
                     break;
                 } else {
@@ -865,7 +1190,7 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     }
 
     if (low_cyl < rdb_low_cyl) {
-        fprintf(stderr, "[-] FEHLER: Start-Zylinder %u liegt im reservierten RDB-Bereich (< %u)!\n", low_cyl, rdb_low_cyl);
+        fprintf(stderr, "[-] FEHLER: Start-Zylinder %u liegt im reservierten Tabellen-Bereich (< %u)!\n", low_cyl, rdb_low_cyl);
         return 1;
     }
 
@@ -882,8 +1207,14 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     int new_part_sec = -1;
     uint8_t test_block[SECTOR_SIZE];
     for (int s = 3; s < RDB_SECTORS_RESERVED; s++) {
-        lseek(fd, (off_t)(s * SECTOR_SIZE), SEEK_SET);
-        read(fd, test_block, SECTOR_SIZE);
+        if (seek_exact(fd, (off_t)(s * SECTOR_SIZE), SEEK_SET) != 0) {
+            fprintf(stderr, "[-] Fehler: Sektorbereich konnte nicht gelesen werden.\n");
+            return 1;
+        }
+        if (read_exact(fd, test_block, SECTOR_SIZE) != 0) {
+            fprintf(stderr, "[-] Fehler: Tabellenbereich konnte nicht gelesen werden.\n");
+            return 1;
+        }
         uint32_t id = read_be32(&test_block[0]);
         if (id == 0x00000000 || id == 0xFFFFFFFF) {
             new_part_sec = s;
@@ -892,7 +1223,7 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
     }
 
     if (new_part_sec == -1) {
-        fprintf(stderr, "[-] Kein freier Sektor im RDB-Bereich (0-63) auf '%s' gefunden.\n", device);
+        fprintf(stderr, "[-] Kein freier Sektor im Tabellen-Bereich (0-63) auf '%s' gefunden.\n", device);
         return 1;
     }
 
@@ -901,7 +1232,7 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
 
     write_be32(&part[0], ID_PART);
     write_be32(&part[4], 64);
-    write_be32(&part[16], 0xFFFFFFFF); /* pe_Next Ende der Kette */
+    write_be32(&part[16], 0xFFFFFFFF); /* pe_Next, wird unten ggf. gesetzt */
 
     size_t name_len = strlen(part_name);
     if (name_len > 31) name_len = 31;
@@ -910,56 +1241,117 @@ static int do_mkpart(int fd, const char *device, const char *part_name,
 
     write_be32(&part[128], 16);
     write_be32(&part[132], 128);
-    write_be32(&part[140], surfaces);
-    write_be32(&part[148], sectors_per_track);
+    write_be32(&part[140], surfaces);              /* de_Surfaces */
+    write_be32(&part[144], 1);                     /* de_SectorPerBlock */
+    write_be32(&part[148], sectors_per_track);     /* de_BlocksPerTrack */
+    write_be32(&part[152], 0);                     /* de_Reserved */
+    write_be32(&part[156], 0);                     /* de_PreAlloc */
+    write_be32(&part[160], 0);                     /* de_Interleave */
     write_be32(&part[164], low_cyl);
     write_be32(&part[168], high_cyl);
+    write_be32(&part[172], 30);                    /* de_NumBuffers */
+    write_be32(&part[176], 0);                     /* de_BufMemType */
+    write_be32(&part[180], 0x00FFFFFF);            /* de_MaxTransfer */
+    write_be32(&part[184], 0x7FFFFFFE);            /* de_Mask */
+    write_be32(&part[188], 0);                     /* de_BootPri */
     write_be32(&part[192], dostype);
 
+    int new_partition_number = 1;
+    uint32_t next_part = first_part;
+    uint32_t previous_part = 0;
+    uint8_t next_block[SECTOR_SIZE];
+
+    while (next_part != 0xFFFFFFFF && next_part != 0) {
+        if (seek_exact(fd, (off_t)(next_part * SECTOR_SIZE), SEEK_SET) != 0 ||
+            read_exact(fd, next_block, SECTOR_SIZE) != 0) {
+            fprintf(stderr, "[-] Fehler beim Lesen der Partitionenkette.\n");
+            return 1;
+        }
+        if (read_be32(&next_block[0]) != ID_PART) {
+            break;
+        }
+        if (low_cyl < read_be32(&next_block[164])) {
+            break;
+        }
+        previous_part = next_part;
+        next_part = read_be32(&next_block[16]);
+        new_partition_number++;
+    }
+
+    write_be32(&part[16], next_part);
     update_rdb_checksum(part);
 
     /* Schreibe neuen Partitionsblock zuerst */
-    lseek(fd, (off_t)(new_part_sec * SECTOR_SIZE), SEEK_SET);
-    write(fd, part, SECTOR_SIZE);
+    if (seek_exact(fd, (off_t)(new_part_sec * SECTOR_SIZE), SEEK_SET) != 0 ||
+        write_exact(fd, part, SECTOR_SIZE) != 0) {
+        perror("[-] Fehler beim Schreiben des neuen Partitionsblocks");
+        return 1;
+    }
 
-    /* Kette verlinken */
-    if (first_part == 0xFFFFFFFF || first_part == 0) {
+    /* Kette in Zylinderreihenfolge verlinken */
+    if (previous_part == 0) {
         write_be32(&rdsk[28], (uint32_t)new_part_sec);
         update_rdb_checksum(rdsk);
-        lseek(fd, (off_t)(rdsk_sec * SECTOR_SIZE), SEEK_SET);
-        write(fd, rdsk, SECTOR_SIZE);
-    } else {
-        uint32_t curr = first_part;
-        uint32_t prev = 0;
-        uint8_t curr_block[SECTOR_SIZE];
-        
-        while (curr != 0xFFFFFFFF && curr != 0) {
-            prev = curr;
-            lseek(fd, (off_t)(curr * SECTOR_SIZE), SEEK_SET);
-            if (read(fd, curr_block, SECTOR_SIZE) != SECTOR_SIZE) break;
-            curr = read_be32(&curr_block[16]);
+        if (seek_exact(fd, (off_t)(rdsk_sec * SECTOR_SIZE), SEEK_SET) != 0) {
+            perror("[-] Fehler beim Schreiben des RDB-Headers");
+            return 1;
         }
-
-        if (prev != 0) {
-            lseek(fd, (off_t)(prev * SECTOR_SIZE), SEEK_SET);
-            read(fd, curr_block, SECTOR_SIZE);
-            write_be32(&curr_block[16], (uint32_t)new_part_sec);
-            update_rdb_checksum(curr_block);
-            lseek(fd, (off_t)(prev * SECTOR_SIZE), SEEK_SET);
-            write(fd, curr_block, SECTOR_SIZE);
+        if (write_exact(fd, rdsk, SECTOR_SIZE) != 0) {
+            perror("[-] Fehler beim Schreiben des RDB-Headers");
+            return 1;
+        }
+    } else {
+        write_be32(&next_block[16], (uint32_t)new_part_sec);
+        update_rdb_checksum(next_block);
+        if (seek_exact(fd, (off_t)(previous_part * SECTOR_SIZE), SEEK_SET) != 0 ||
+            write_exact(fd, next_block, SECTOR_SIZE) != 0) {
+            perror("[-] Fehler beim Schreiben des Vorgängerblocks");
+            return 1;
         }
     }
 
     fsync(fd);
-    printf("[+] Partition '%s' (%s - 0x%08X) in RDB-Sektor %d auf '%s' angelegt (Zylinder %u - %u)!\n", 
-           part_name, fs_str, dostype, new_part_sec, device, low_cyl, high_cyl);
+
+    int reread_ok = 1;
+    if (ioctl(fd, BLKRRPART) < 0) {
+        reread_ok = 0;
+        fprintf(stderr, "[!] Warnung: Konnte Partitionstabelle nicht automatisch beim Kernel aktualisieren: %s\n", strerror(errno));
+        fprintf(stderr, "    Bitte manuell 'partprobe %s' oder 'blockdev --rereadpt %s' ausführen.\n", device, device);
+    } else {
+        printf("[+] Partitionstabelle erfolgreich beim Kernel neu eingelesen.\n");
+    }
+
+    if (reread_ok) {
+        ensure_partition_device_node(device, (unsigned int)new_partition_number);
+    }
+
+    uint64_t start_bytes = (uint64_t)low_cyl * cyl_size_bytes;
+    printf("[+] Partition '%s' (%s - 0x%08X) in Sektor %d auf '%s' angelegt (Zylinder %u - %u, Offset: %llu Bytes)!\n", 
+           part_name, fs_str, dostype, new_part_sec, device, low_cyl, high_cyl, (unsigned long long)start_bytes);
 
     return 0;
 }
 
-static void print_fs_help(void) {
+typedef enum {
+    HELP_GERMAN,
+    HELP_ENGLISH
+} HelpLanguage;
+
+static int is_language(const char *arg) {
+    return (strcasecmp(arg, "de") == 0 || strcasecmp(arg, "deutsch") == 0 ||
+            strcasecmp(arg, "en") == 0 || strcasecmp(arg, "english") == 0);
+}
+
+static HelpLanguage parse_language(const char *arg) {
+    return (strcasecmp(arg, "en") == 0 || strcasecmp(arg, "english") == 0)
+               ? HELP_ENGLISH : HELP_GERMAN;
+}
+
+static void print_fs_help(HelpLanguage language) {
     printf("===============================================================================\n");
-    printf(" Unterstützte Dateisysteme / DosTypes für <fs_type>\n");
+    printf(language == HELP_ENGLISH
+               ? " Supported filesystems / DosTypes for <fs_type>\n"
+               : " Unterstützte Dateisysteme / DosTypes für <fs_type>\n");
     printf("===============================================================================\n\n");
     for (int i = 0; dostype_table[i].name != NULL; i++) {
         uint32_t dt = dostype_table[i].dostype;
@@ -978,41 +1370,84 @@ static void print_fs_help(void) {
     printf("\n");
 }
 
-static void print_units_help(void) {
+static void print_units_help(HelpLanguage language) {
     printf("===============================================================================\n");
-    printf(" Einheiten & Größenangaben für <start> und <end>\n");
+    printf(language == HELP_ENGLISH
+               ? " Units and size specifications for <start> and <end>\n"
+               : " Einheiten & Größenangaben für <start> und <end>\n");
     printf("===============================================================================\n\n");
-    printf("  - Zahl:     2 oder 500\n");
-    printf("  - Relativ:  +500M, +2G\n");
-    printf("  - Auto:     + oder auto (sucht automatisch die erste passende Lücke)\n");
-    printf("  - Prozent:  100%% (bei Auto bezieht sich auf die Größe der freien Lücke)\n\n");
+    if (language == HELP_ENGLISH) {
+        printf("  - Number:    2 or 500\n");
+        printf("  - Relative:  +500M, +2G\n");
+        printf("  - Automatic: + or auto (finds the first suitable free space)\n");
+        printf("  - Percent:   100%% (with auto, relative to the free space size)\n\n");
+    } else {
+        printf("  - Zahl:     2 oder 500\n");
+        printf("  - Relativ:  +500M, +2G\n");
+        printf("  - Auto:     + oder auto (sucht automatisch die erste passende Lücke)\n");
+        printf("  - Prozent:  100%% (bei Auto bezieht sich auf die Größe der freien Lücke)\n\n");
+    }
 }
 
-static void print_help(const char *prog, const char *topic) {
+static void print_help(const char *prog, const char *topic, HelpLanguage language) {
     if (topic != NULL) {
         if (strcasecmp(topic, "fs_type") == 0 || strcasecmp(topic, "fs") == 0) {
-            print_fs_help();
+            print_fs_help(language);
             return;
         }
         if (strcasecmp(topic, "units") == 0) {
-            print_units_help();
+            print_units_help(language);
             return;
         }
     }
 
     printf("===============================================================================\n");
-    printf(" Amiga RDB Partitioning Tool - Hilfe & Dokumentation\n");
+    printf(language == HELP_ENGLISH
+               ? " Block Device Partitioning Tool - Help & Documentation\n"
+               : " Block Device Partitioning Tool - Hilfe & Dokumentation\n");
     printf("===============================================================================\n\n");
-    printf("SYNTAX:\n");
-    printf("  1) Disklabel initialisieren:\n     %s <device> mklabel [rdb|amiga] [--force]\n\n", prog);
-    printf("  2) Partition anlegen:\n     %s <device> mkpart <name> <fs> <start> <end>\n\n", prog);
-    printf("  3) Partition löschen:\n     %s <device> rmpart <nr|name> [--force]\n\n", prog);
-    printf("  4) Partition umbenennen:\n     %s <device> rename <nr|old_name> <new_name>\n\n", prog);
-    printf("  5) Belegung & Freispeicher anzeigen:\n     %s <device> free\n\n", prog);
-    printf("BEISPIELE:\n");
+    if (language == HELP_ENGLISH) {
+        printf("SYNTAX:\n");
+        printf("  1) Initialize disk label:\n     %s <device> mklabel [rdb] [--force]\n\n", prog);
+        printf("  2) Create partition:\n     %s <device> mkpart <name> <fs> <start> <end>\n\n", prog);
+        printf("  3) Delete partition:\n     %s <device> rmpart <nr|name> [--force]\n\n", prog);
+        printf("  4) Rename partition:\n     %s <device> rename <nr|old_name> <new_name>\n\n", prog);
+        printf("  5) Show usage, free space and offsets:\n     %s <device> free\n\n", prog);
+        printf("TOPICS: %s --help fs | %s --help units\n\n", prog, prog);
+        printf("OPTIONS:\n");
+        printf("  --force, -f       Skip the confirmation prompt where supported.\n");
+        printf("  --help en|de      Select the help language (default: German).\n\n");
+        printf("NOTES:\n");
+        printf("  - Filesystem names are case-insensitive (ext3, EXT3 and ExT3 are equivalent).\n");
+        printf("  - RDB partition numbers follow cylinder order and may change after edits.\n");
+        printf("  - Device nodes are created or corrected after a successful kernel refresh.\n");
+        printf("  - Mounted or active swap partitions cannot be deleted.\n");
+        printf("  - SFS/PFS3/FFS filesystem drivers are not embedded in this tool; install them separately.\n\n");
+        printf("EXAMPLES:\n");
+    } else {
+        printf("SYNTAX:\n");
+        printf("  1) Disklabel initialisieren:\n     %s <device> mklabel [rdb] [--force]\n\n", prog);
+        printf("  2) Partition anlegen:\n     %s <device> mkpart <name> <fs> <start> <end>\n\n", prog);
+        printf("  3) Partition löschen:\n     %s <device> rmpart <nr|name> [--force]\n\n", prog);
+        printf("  4) Partition umbenennen:\n     %s <device> rename <nr|old_name> <new_name>\n\n", prog);
+        printf("  5) Belegung, Freispeicher & Offsets anzeigen:\n     %s <device> free\n\n", prog);
+        printf("THEMEN: %s --help fs | %s --help units\n\n", prog, prog);
+        printf("OPTIONEN:\n");
+        printf("  --force, -f       Bestätigungsabfrage überspringen, sofern unterstützt.\n");
+        printf("  --help en|de      Sprache der Hilfe wählen (Standard: Deutsch).\n\n");
+        printf("HINWEISE:\n");
+        printf("  - Dateisystemnamen sind unabhängig von Groß-/Kleinschreibung (ext3, EXT3, ExT3).\n");
+        printf("  - RDB-Partitionsnummern folgen der Zylinderreihenfolge und können sich ändern.\n");
+        printf("  - Device-Nodes werden nach erfolgreichem Kernel-Refresh angelegt oder korrigiert.\n");
+        printf("  - Gemountete oder aktive Swap-Partitionen können nicht gelöscht werden.\n");
+        printf("  - SFS/PFS3/FFS-Treiber sind nicht eingebettet und müssen separat installiert werden.\n\n");
+        printf("BEISPIELE:\n");
+    }
     printf("  %s /dev/hda mklabel rdb\n", prog);
     printf("  %s /dev/hda mkpart test SFS + +100M\n", prog);
-    printf("  %s /dev/hda mkpart test2 SFS + +100%%\n", prog);
+    printf("  %s /dev/hda mkpart test3 EXT3 + +2G\n", prog);
+    printf("  %s /dev/hda mkpart SWAP SWAP + +2G\n", prog);
+    printf("  mkswap /dev/hda5 && swapon /dev/hda5\n");
     printf("  %s /dev/hda rmpart 1\n", prog);
     printf("  %s /dev/hda rename DH1 Work\n", prog);
     printf("  %s /dev/hda free\n", prog);
@@ -1028,17 +1463,30 @@ static int is_help_flag(const char *arg) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        print_help(argv[0], NULL);
+        print_help(argv[0], NULL, HELP_GERMAN);
         return 0;
     }
 
     if (is_help_flag(argv[1])) {
-        print_help(argv[0], (argc >= 3) ? argv[2] : NULL);
+        const char *topic = NULL;
+        HelpLanguage language = HELP_GERMAN;
+        for (int i = 2; i < argc; i++) {
+            if (is_language(argv[i])) {
+                language = parse_language(argv[i]);
+            } else {
+                topic = argv[i];
+            }
+        }
+        print_help(argv[0], topic, language);
         return 0;
     }
 
     if (argc >= 3 && is_help_flag(argv[2])) {
-        print_help(argv[0], argv[1]);
+        HelpLanguage language = HELP_GERMAN;
+        if (argc >= 4 && is_language(argv[3])) {
+            language = parse_language(argv[3]);
+        }
+        print_help(argv[0], argv[1], language);
         return 0;
     }
 
@@ -1115,12 +1563,8 @@ int main(int argc, char *argv[]) {
             res = do_mkpart(fd, device, argv[3], argv[4], argv[5], argv[6]);
         }
     } else {
-        if (argc < 6) {
-            fprintf(stderr, "[-] FEHLER: Unbekannter Befehl: '%s'\n", cmd);
-            res = 1;
-        } else {
-            res = do_mkpart(fd, device, argv[2], argv[3], argv[4], argv[5]);
-        }
+        fprintf(stderr, "[-] FEHLER: Unbekannter Befehl: '%s'\n", cmd);
+        res = 1;
     }
 
     close(fd);
