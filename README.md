@@ -256,6 +256,8 @@ zum Beispiel:
 
 ```sh
 mkfs.ext3 /dev/hda4
+#für Pegasos2 
+mkfs.ext3 -F -I 128 -O none,has_journal,sparse_super /dev/hda4
 mkswap /dev/hda5
 ```
 
